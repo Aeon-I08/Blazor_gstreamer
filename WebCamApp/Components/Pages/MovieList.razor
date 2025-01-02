@@ -1,0 +1,114 @@
+﻿@page "/MovieList"
+@using WebCamApp.Data
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.AspNetCore.Components.QuickGrid
+
+@inject IDbContextFactory<MovieDbContext> DbFactory
+@inject IJSRuntime JS
+
+<h3>MovieList</h3>
+
+@if (movies == null) {
+	<div>データロード中...</div>
+}
+else {
+}
+
+@*動画ダウンロード時のスクリプト*@
+<script>
+	window.downloadFileFromStream = async (fileName, contentStreamReference) => {
+		const arrayBuffer = await contentStreamReference.arrayBuffer();
+		const blob = new Blob([arrayBuffer]);
+		const url = URL.createObjectURL(blob);
+		const anchorElement = document.createElement('a');
+		anchorElement.href = url;
+		anchorElement.download = fileName ?? '';
+		anchorElement.click();
+		anchorElement.remove();
+		URL.revokeObjectURL(url);
+	}
+</script>
+
+@* メイン画面 *@
+<div>
+	<button onclick="@(() => DeleteMovie())">削除</button>
+	<QuickGrid Items="@movies" ResizableColumns="true" Pagination="@PageState">
+		<TemplateColumn Title="選択">
+			<input type="checkbox" @onchange="@((e) => OnCheckboxChanged(context.Id, (bool)e.Value))" />
+		</TemplateColumn>
+		<PropertyColumn Property="@(a => a.Id)" Sortable="true" Title="ID" />
+		<PropertyColumn Property="@(a => a.Name)" Sortable="true" Title="名前" />
+		<PropertyColumn Property="@(a => a.StartTime)" Sortable="true" Title="開始時刻" />
+		<PropertyColumn Property="@(a => a.EndTime)" Sortable="true" Title="終了時刻" />
+		<TemplateColumn Title="動画ダウンロード">
+			@* contextには行のデータが入っている *@
+			<button @onclick="@(() => ButtonClickAsync(context.Id, context.Name))">Download</button>
+		</TemplateColumn>
+	</QuickGrid>
+	<Paginator State="@PageState"/>
+</div>
+
+@code {
+	private IQueryable<Movie>? movies = null;
+	private List<int> SelectedMovieIds = new();
+	private PaginationState PageState = new() { ItemsPerPage = 10 };
+
+	protected override async Task OnInitializedAsync() {
+		await using (var video = await DbFactory.CreateDbContextAsync()) {
+			movies = (await video.Movies.ToListAsync()).AsQueryable();
+		}
+	}
+
+	// ダウンロードボタンクリック時
+	private async Task ButtonClickAsync(int id, string name) {
+		using (MovieDbContext movies2 = DbFactory.CreateDbContext()) {
+			var query = movies2.MovieDatas.Where(a => a.Id == id);
+			MovieData ret = query.FirstOrDefault();
+			if (ret == null) {
+				Console.WriteLine("Data is null.");
+				return;
+			}
+
+			// 録画データを読み込んでストリームダウンロード
+			var fs = new MemoryStream(ret.RecordData);
+			using var stream = new DotNetStreamReference(stream: fs);
+			await JS.InvokeVoidAsync("downloadFileFromStream", name, stream);
+		}
+	}
+
+	// チェックボックスの操作
+	private void OnCheckboxChanged(int movieid, bool ischecked) {
+		if (ischecked) {
+			SelectedMovieIds.Add(movieid);
+		}
+		else {
+			SelectedMovieIds.Remove(movieid);
+		}
+	}
+
+	// 削除ボタンクリック時
+	private async Task DeleteMovie() {
+		if (SelectedMovieIds.Count == 0) return;
+
+		using (MovieDbContext movies2 = DbFactory.CreateDbContext()) {
+			// チェックボックスで選択されている個数分の削除
+			foreach (var ids in SelectedMovieIds) {
+				var MovieToDelete = movies2.Movies.FirstOrDefault(m => m.Id == ids);
+				var DataToDelete = movies2.MovieDatas.FirstOrDefault(m => m.Id == ids);
+
+				if (MovieToDelete != null) {
+					movies2.Movies.Remove(MovieToDelete);
+				}
+				if (DataToDelete != null) {
+					movies2.MovieDatas.Remove(DataToDelete);
+				}
+			}
+			await movies2.SaveChangesAsync();
+		}
+
+		// データ更新
+		await using (var video = await DbFactory.CreateDbContextAsync()) {
+			movies = (await video.Movies.ToListAsync()).AsQueryable();
+		}
+	}
+}

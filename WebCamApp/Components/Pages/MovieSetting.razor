@@ -1,0 +1,204 @@
+﻿@page "/MovieSetting"
+@using WebCamApp.Data
+@using Microsoft.EntityFrameworkCore
+@using System.ComponentModel.DataAnnotations;
+@using Microsoft.AspNetCore.Mvc;
+
+@inject IDbContextFactory<MovieDbContext> DbFactory
+
+<h3>MovieSetting</h3>
+
+<!-- 画面の描画-->
+<EditForm Model="@VSVM" OnValidSubmit="@RecordStart">
+	<DataAnnotationsValidator />
+	<dl>
+		<dt>解像度</dt>
+		<dd>
+			<select @bind="VSVM.Resolution">
+				@foreach (var item in VSVM.ResolutionList) { 
+					<option value="@item.Key">@item.Value</option>
+				}
+			</select>
+		</dd>
+		<dt>録画時間[秒]</dt>
+		<dd>
+			<InputNumber @bind-value="VSVM.RecordingTime" />
+		</dd>
+	</dl>
+	<ValidationSummary />
+	<button class="btn btn-primary" type="submit">@BtnStr</button>
+</EditForm>
+
+@code {
+	// gstreamerで処理できるよう\を/へ置換する
+	private static string SaveDir = Path.GetTempPath().Replace("\\", "/");
+	private GstClass GstClass = new GstClass();
+	private string BtnStr = "Start";
+	public static VideoSettingViewModel VSVM { get; set; } = new VideoSettingViewModel();
+
+	// カメラ用パラメータ
+	// 接続するカメラに併せて変更すること
+	private string CAM1IPAddr = "192.168.11.29";
+	private int PortNum = 554;
+	private string UserID = "tapo320";
+	private string UserPW = "tapo320";
+	private string Format = "H264";
+	private uint FPS = 15;
+
+	private void ButtonReset() { 
+		Running = false;
+		BtnStr = "Start";
+	}
+
+	private bool Running = false;
+	private async Task RecordStart() {
+		if (Running) return;
+
+		Running = true;
+		BtnStr = "Rocording";
+
+		uint rectime;
+		try {
+			rectime = Convert.ToUInt32(VSVM.RecordingTime);
+		}
+		catch (Exception ex) {
+			Console.WriteLine($"RecordingTime convert error : {ex.Message}");
+			ButtonReset();
+			return;
+		}
+
+		// 保存先を作成(tempdirを指定しているので要らないかも)
+		try {
+			Directory.CreateDirectory(SaveDir);
+		}
+		catch (Exception ex){
+			Console.WriteLine($"Create directory error : {ex.Message}");
+			ButtonReset();
+			return;
+		}
+
+		// コマンドライン作成
+		string tmpfilename = "tmp.mp4";
+		string stream = VSVM.Resolution;
+		string cmd
+			= $"rtspsrc location = rtsp://{CAM1IPAddr}:{PortNum}/{stream} ntp-sync=true latency=4000 user-id={UserID} user-pw={UserPW} ! application/x-rtp, media=video, encoding-name={Format} "
+			+ "! queue2 "
+			+ "! identity name=IDT "
+			+ "! rtph264depay "
+			+ "! h264parse "
+			+ "! mpegtsmux latency=4000 "
+			+ "! filesink sync=true location="
+			+ SaveDir + tmpfilename;
+		// 下記はvideotestsrcで試す場合
+		// string cmd
+		// = "videotestsrc "
+		// + "! video/x-raw,width=1280,height=720,framerate=15/1 "
+		// + "! qsvh264enc "
+		// + "! h264parse "
+		// + "! identity name=IDT "
+		// + "! mpegtsmux "
+		// + "! filesink location="
+		// + SaveDir + tmpfilename;
+
+		Console.WriteLine($"cmd = {cmd}"); // デバッグ用出力
+		GstClass.Initialize();
+
+		// 録画実行
+		if (!GstClass.Start(cmd, rectime, FPS)) {
+			GstClass.Stop();
+			ButtonReset();
+			return;
+		}
+
+		DateTime start = DateTime.Now;
+		Console.WriteLine("Start = " + start);
+
+		// 録画終了(指定フレームになる)まで待つ
+		while (!GstClass.IsFinished()) {
+			await Task.Delay(100);
+		}
+		GstClass.Stop();
+		DateTime end = DateTime.Now;
+		Console.WriteLine("Finish = " + end);
+
+		string filename = start.ToString("yyyyMMddHHmmss") + "_" + end.ToString("yyyyMMddHHmmss") + ".mp4";
+		try　{
+			// テンポラリファイルをリネーム
+			File.Move(SaveDir + tmpfilename, SaveDir + filename);
+			// DBに登録する
+			await AddRecord(start, end, filename);
+		}
+		catch (Exception ex) { 
+			Console.WriteLine($"File move error : {ex.Message}");
+		}
+
+		// 元データ削除
+		try {
+			File.Delete(SaveDir + filename);
+		}
+		catch (Exception ex) {
+			Console.WriteLine($"Delete error : {ex.Message}");
+		}
+
+		Running = false;
+		BtnStr = "Start";
+	}
+
+	//　データベースに録画データを登録する
+	private async Task AddRecord(DateTime start, DateTime end, string filename) {
+		Movie movie = new Movie();
+		movie.Name = filename;
+		movie.StartTime = start;
+		movie.EndTime = end;
+		MovieData mdata = new MovieData();
+
+		using (FileStream fs = new FileStream(SaveDir + filename, FileMode.Open, FileAccess.Read)) {
+			long size = fs.Length;
+			mdata.RecordData = new byte[size];
+			fs.Read(mdata.RecordData, 0, (int)size);
+		}
+
+		// DBへの登録
+		await using (MovieDbContext movies = DbFactory.CreateDbContext()) {
+			movies.Movies.Add(movie);
+
+			try {
+				await movies.SaveChangesAsync();
+			}
+			catch (Exception ex) {
+				Console.WriteLine($"Save change failed(movie) : {ex.Message}");
+				return;
+			}
+
+			// 自動で割り当てられたIDを取得し、MoviData側を更新
+			mdata.Id = movie.Id;
+			movies.MovieDatas.Add(mdata);
+
+			try {
+				await movies.SaveChangesAsync();
+			}
+			catch (Exception ex) {
+				Console.WriteLine($"Save change failed(movie_data) : {ex.Message}");
+				return;
+			}
+		}
+	}
+
+	// ビュークラス
+	public class VideoSettingViewModel {
+		//ドロップダウンのため入力チェック不要
+		[Display(Name = "解像度")]
+		public string Resolution { get; set; } = "stream1";
+
+		[Display(Name = "録画時間[秒]")]
+		[Required(ErrorMessage = "録画時間は必須入力です。")]
+		[Range(10,600, ErrorMessage = "10~600で入力してください。")]
+		public int RecordingTime { get; set; } = 10;
+
+		// ネットワークカメラに合わせてリストは変更すること
+		public Dictionary<string, string> ResolutionList = new Dictionary<string, string>() {
+			{"stream1", "1920x1080"},
+			{"stream2", "640x360"},
+		};
+	}
+}
